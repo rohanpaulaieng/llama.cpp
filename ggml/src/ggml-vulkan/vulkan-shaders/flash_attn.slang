@@ -1,3 +1,4 @@
+import common;
 import types;
 import flash_attn_loader;
 
@@ -243,6 +244,35 @@ typealias VLoader = ScalarKVLoader<half>;
 void gqaStore<T: __BuiltinFloatingPointType>(const in uint32_t r, const in uint32_t c, const in vector<T, 4> elems, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N) {
     uint32_t offset = (iq2 + r) * HSV / 4 + c;
     data_ov4[o_offset + offset] = vector<D_TYPE, 4>(elems);
+}
+
+public T reduce<T: __BuiltinType, Op: IReduceOp<T>>(T value, uint from, uint to) {
+    const uint subgroup_id = WaveGetWaveIndex();
+    const uint lane_id = WaveGetLaneIndex();
+    const uint from_id = lane_id % from;
+    const uint subgroup_size = WaveGetLaneCount();
+
+    T * shmem = (T *) &tmpsh[0];
+
+    // Reduce with subgroup ops first
+    [unroll] for (uint s = from; s < min(to, subgroup_size); s *= 2) {
+        value = Op::combine(value, WaveReadLaneAt(value, lane_id ^ s));
+    }
+
+    if (to > subgroup_size) {
+        // Reduce inside workgroup with shmem
+        GroupMemoryBarrierWithGroupSync();
+        if (lane_id < from) {
+            shmem[subgroup_id * from + from_id] = value;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        value = shmem[from_id];
+        [unroll] for (uint s = 1; s < to / subgroup_size; ++s) {
+            value = Op::combine(value, shmem[s * from + from_id]);
+        }
+    }
+
+    return value;
 }
 
 [shader("compute")]
@@ -566,34 +596,7 @@ void main(
         float rowmaxf = Mf[r];
 
         // Compute max across the row
-        if (SubGroupSize > 0) {
-            [unroll] for (uint s = D_split; s < SubGroupSize; s *= 2) {
-                rowmaxf = max(rowmaxf, WaveReadLaneAt(rowmaxf, subgroup_invocation_id ^ s));
-            }
-            if (row_split == 1) {
-                // Reduce inside workgroup with shmem
-                GroupMemoryBarrierWithGroupSync();
-                if (subgroup_invocation_id == d_tid) {
-                    tmpsh[subgroup_id * D_split + d_tid] = rowmaxf;
-                }
-                GroupMemoryBarrierWithGroupSync();
-                rowmaxf = tmpsh[d_tid];
-                [unroll] for (uint s = 1; s < num_subgroups; ++s) {
-                    rowmaxf = max(rowmaxf, tmpsh[s * D_split + d_tid]);
-                }
-            }
-        } else {
-            GroupMemoryBarrierWithGroupSync();
-            tmpsh[tid] = rowmaxf;
-            GroupMemoryBarrierWithGroupSync();
-            [unroll] for (int s = int(threads_per_rowgroup) / 2; s >= D_split; s >>= 1) {
-                if (rowgroup_tid < s) {
-                    tmpsh[tid] = max(tmpsh[tid], tmpsh[tid ^ s]);
-                }
-                GroupMemoryBarrierWithGroupSync();
-            }
-            rowmaxf = tmpsh[row_tid * threads_per_rowgroup + d_tid];
-        }
+        rowmaxf = reduce<float, MaxOp<float>>(rowmaxf, D_split, threads_per_rowgroup);
 
         float Moldf = Mf[r];
 
